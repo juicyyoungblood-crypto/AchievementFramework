@@ -1,0 +1,65 @@
+[
+  {
+    "name": "Good Start",
+    "action": "kill",
+    "modifier": "none",
+    "amount": 500,
+    "rewardType": "item",
+    "reward": "Base.Bag_ALICEpack",
+    "rewardAmount": 1
+  },
+  {
+    "name": "God of War",
+    "action": "kill",
+    "modifier": "none",
+    "amount": 1000,
+    "rewardType": "item",
+    "reward": "Base.AssaultRifle",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Can't Have One Without the Other",
+    "action": "kill",
+    "modifier": "none",
+    "amount": 1001,
+    "rewardType": "item",
+    "reward": "Base.556Clip",
+    "rewardAmount": 3
+  },
+  {
+    "name": "Let's Up Those Numbers",
+    "action": "kill",
+    "modifier": "none",
+    "amount": 1002,
+    "rewardType": "item",
+    "reward": "Base.556Carton",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Prepper",
+    "action": "daysSurvived",
+    "modifier": "none",
+    "amount": 1,
+    "rewardType": "item",
+    "reward": "Base.HandAxe",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Survivor",
+    "action": "daysSurvived",
+    "modifier": "none",
+    "amount": 14,
+    "rewardType": "item",
+    "reward": "Base.Axe",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Reader",
+    "action": "read",
+    "modifier": "none",
+    "amount": 20,
+    "rewardType": "skill_xp",
+    "reward": "Electricity",
+    "rewardAmount": 500
+  }
+]
