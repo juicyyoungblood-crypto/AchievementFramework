@@ -1,0 +1,5 @@
+{
+    "Sandbox_AchievementFramework": "Achievement Framework",
+    "Sandbox_AchievementFramework_BrowserHotkey": "Achievements tab hotkey (key code)",
+    "Sandbox_AchievementFramework_BrowserHotkey_tooltip": "In-game key to open the character sheet Achievements tab (claim/progress). Default 36 = J. The authoring Browser (add achievements) is only on this page via Open Achievement Browser (debug/sandbox)."
+}
