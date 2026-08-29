@@ -1,0 +1,7 @@
+{
+    "Sandbox_AchievementFramework": "Achievement Framework",
+    "Sandbox_AchievementFramework_BrowserHotkey": "Achievements tab hotkey (key code)",
+    "Sandbox_AchievementFramework_BrowserHotkey_tooltip": "In-game key to open the character sheet Achievements tab (claim/progress). Default 36 = J. Authoring Browser is only via Open Achievement Browser on this page (debug/admin sandbox).",
+    "Sandbox_AchievementFramework_DebugLog": "Debug logging",
+    "Sandbox_AchievementFramework_DebugLog_tooltip": "When ON: write AF_debug.log and counter dumps more often. Leave OFF for normal play (better performance)."
+}
