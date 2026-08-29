@@ -1,0 +1,1362 @@
+--[[ AF_Main v0.8.1
+  Evidence from 0.7.0 playtest:
+  - Boot hooks OK at f:0; ZERO AF lines across 30k in-world frames
+  - Knox OnWeaponHitXp + AU OnHitZombie/OnZombieDead both worked same session
+  - AF_check stuck on OnCreateLivingCharacter
+
+  0.8.0 strategy (proven patterns):
+  1) Kill/damage: Events.OnHitZombie + Events.OnZombieDead (AU path)
+  2) Also OnWeaponHitXp / OnWeaponHitCharacter (Knox path), each body in pcall
+  3) Actions: re-hook queue on OnGameStart; OnTick poll queue.current / onCompleted
+  4) Heartbeat: OnTick frame counter (no getTimestampMs gate)
+  5) Every handler first line prints; file write never blocks print
+  6) No pairs(_G) scan during play; no select()
+]]
+print("[AF] ===== AF_Main 0.8.1 LOADED =====")
+
+AF = AF or {}
+AF.VERSION = "0.12.3"
+AF.MODDATA_KEY = "AF_Track"
+AF.BARE_HANDS = "BareHands"
+AF.Track = AF.Track or {}
+local Track = AF.Track
+
+local S = {
+    wrote = false,
+    lastWrite = 0,
+    pending = false,
+    tick = 0,
+    lastBeatTick = 0,
+    lastAction = {},
+    lastActionTyp = {},
+    beforeInv = {},
+    finished = {},
+    seenType = {},
+    queueHooked = false,
+    wrapCount = 0,
+    lastPlayer = nil,
+    zedHit = {}, -- zombie -> { weapon, t }
+    hitArgsOnce = false,
+    installed = false,
+}
+
+local function dbg(msg)
+    local line = "[AF] " .. tostring(msg)
+    print(line)
+    if not getFileWriter then return end
+    pcall(function()
+        local w = getFileWriter("AF_debug.log", true, true)
+        if w then
+            w:write(line .. "\n")
+            w:close()
+        end
+    end)
+end
+
+local function openW(name, append)
+    if not getFileWriter then return nil end
+    local w
+    pcall(function() w = getFileWriter(name, true, append and true or false) end)
+    return w
+end
+
+local function nowMs()
+    local n = 0
+    pcall(function()
+        if getTimestampMs then n = tonumber(getTimestampMs()) or 0 end
+    end)
+    return n
+end
+
+local function lower(s) return string.lower(tostring(s or "")) end
+
+dbg("boot " .. AF.VERSION)
+
+-- ---------------- store ----------------
+local function ensure(d, n)
+    if type(d[n]) ~= "table" then d[n] = { total = 0 } end
+    if d[n].total == nil then d[n].total = 0 end
+end
+
+function Track.getData(player)
+    if not player then return nil end
+    local md
+    if not pcall(function() md = player:getModData() end) or type(md) ~= "table" then return nil end
+    if type(md[AF.MODDATA_KEY]) ~= "table" then
+        md[AF.MODDATA_KEY] = {
+            killed = { total = 0, type = {} },
+            damage = { total = 0, type = {} },
+            made = { total = 0 },
+            eaten = { total = 0 },
+            fished = { total = 0 },
+            read = { total = 0, magazinecomic = 0, recipe = 0, book = 0, skillbook = 0 },
+            daysSurvived = 0,
+        }
+    end
+    local d = md[AF.MODDATA_KEY]
+    for _, n in ipairs({ "killed", "damage", "made", "eaten", "read", "fished" }) do ensure(d, n) end
+    if type(d.killed.type) ~= "table" then d.killed.type = {} end
+    if type(d.damage.type) ~= "table" then d.damage.type = {} end
+    return d
+end
+
+local function norm(ft)
+    if not ft or ft == "" then return { AF.BARE_HANDS } end
+    if tostring(ft) == AF.BARE_HANDS then return { AF.BARE_HANDS } end
+    local parts = {}
+    for p in string.gmatch(string.lower(tostring(ft)), "[^%.]+") do parts[#parts + 1] = p end
+    return #parts > 0 and parts or { AF.BARE_HANDS }
+end
+
+local function bump(layer, parts, amount)
+    amount = amount or 1
+    layer.total = (layer.total or 0) + amount
+    local node = layer
+    for i = 1, #parts do
+        local k = parts[i]
+        if i == #parts then
+            if type(node[k]) == "table" then
+                node[k .. "_n"] = (node[k .. "_n"] or 0) + amount
+            else
+                node[k] = (node[k] or 0) + amount
+            end
+        else
+            if type(node[k]) ~= "table" then
+                local prev = node[k]
+                node[k] = {}
+                if type(prev) == "number" then node[k]._n = prev end
+            end
+            node = node[k]
+        end
+    end
+end
+
+local function wparts(weapon)
+    if not weapon then return norm(AF.BARE_HANDS) end
+    local ok, f = pcall(function() return weapon:getFullType() end)
+    return (ok and f and f ~= "") and norm(f) or norm(AF.BARE_HANDS)
+end
+
+local function wtypes(weapon)
+    if not weapon then return { "barehands" } end
+    local ranged = false
+    pcall(function() if weapon.isRanged and weapon:isRanged() then ranged = true end end)
+    if ranged then return { "firearm" } end
+    local has = {}
+    local function mark(s)
+        if not s then return end
+        has[string.lower(tostring(s):gsub("%s+", ""))] = true
+    end
+    pcall(function()
+        if weapon.getCategories then
+            local list = weapon:getCategories()
+            if list then
+                if list.size then
+                    for i = 0, list:size() - 1 do mark(list:get(i)) end
+                elseif type(list) == "table" then
+                    for _, s in pairs(list) do mark(s) end
+                end
+            end
+        end
+    end)
+    -- B42 fallbacks: script categories / display category / type string
+    pcall(function()
+        if weapon.getScriptItem then
+            local si = weapon:getScriptItem()
+            if si and si.getCategories then
+                local list = si:getCategories()
+                if list and list.size then
+                    for i = 0, list:size() - 1 do mark(list:get(i)) end
+                end
+            end
+        end
+    end)
+    pcall(function()
+        if weapon.getType then mark(weapon:getType()) end
+    end)
+    pcall(function()
+        if weapon.getFullType then
+            local ft = string.lower(tostring(weapon:getFullType()))
+            if ft:find("axe", 1, true) then mark("axe") end
+            if ft:find("spear", 1, true) then mark("spear") end
+            if ft:find("knife", 1, true) or ft:find("blade", 1, true) then mark("smallblade") end
+            if ft:find("bat", 1, true) or ft:find("club", 1, true) then mark("blunt") end
+        end
+    end)
+    local keys, seen = {}, {}
+    local function push(k) if not seen[k] then seen[k] = true; keys[#keys + 1] = k end end
+    if has["axe"] then push("axe") end
+    if has["spear"] then push("spear") end
+    if has["longblunt"] then push("longblunt"); push("blunt") end
+    if has["smallblunt"] or has["shortblunt"] then push("shortblunt"); push("blunt") end
+    if has["blunt"] and not has["longblunt"] and not has["smallblunt"] and not has["shortblunt"] then
+        push("shortblunt"); push("blunt")
+    end
+    if has["longblade"] then push("longblade"); push("bladed") end
+    if has["smallblade"] or has["shortblade"] or has["knife"] then push("shortblade"); push("bladed") end
+    if has["firearm"] or has["handgun"] then push("firearm") end
+    if #keys == 0 then push("other") end
+    return keys
+end
+
+local function bumpT(layer, weapon, amount)
+    if type(layer.type) ~= "table" then layer.type = {} end
+    for _, k in ipairs(wtypes(weapon)) do
+        layer.type[k] = (layer.type[k] or 0) + (amount or 1)
+    end
+end
+
+local function flat(prefix, node, out)
+    if type(node) ~= "table" then out[#out + 1] = { prefix, node }; return end
+    if node.total ~= nil and type(node.total) ~= "table" then
+        out[#out + 1] = { prefix .. ".total", node.total }
+    end
+    local ks = {}
+    for k, _ in pairs(node) do if k ~= "total" then ks[#ks + 1] = k end end
+    table.sort(ks, function(a, b) return tostring(a) < tostring(b) end)
+    for _, k in ipairs(ks) do
+        local c = node[k]
+        local path = prefix .. "." .. tostring(k)
+        if type(c) == "table" then flat(path, c, out) else out[#out + 1] = { path, c } end
+    end
+end
+
+function Track.refreshDays(player)
+    local d = Track.getData(player)
+    if not d then return end
+    local h = 0
+    pcall(function() h = tonumber(player:getHoursSurvived()) or 0 end)
+    d.daysSurvived = math.floor(h / 24)
+end
+
+function Track.writeCheckLog(player, reason)
+    if not player then return false end
+    Track.refreshDays(player)
+    local d = Track.getData(player)
+    local lines = {
+        "# AF_check.log",
+        "# version " .. AF.VERSION,
+        "# reason " .. tostring(reason),
+        "daysSurvived=" .. tostring(d and d.daysSurvived or 0),
+    }
+    local rows = {}
+    if d then
+        for _, L in ipairs({ "killed", "damage", "made", "eaten", "read", "fished" }) do
+            if d[L] then flat(L, d[L], rows) end
+        end
+    end
+    table.sort(rows, function(a, b) return a[1] < b[1] end)
+    for _, r in ipairs(rows) do
+        local v = r[2]
+        if type(v) == "number" and v ~= math.floor(v) then
+            lines[#lines + 1] = string.format("%s=%.4f", r[1], v)
+        else
+            lines[#lines + 1] = r[1] .. "=" .. tostring(v)
+        end
+    end
+    local body = table.concat(lines, "\n") .. "\n"
+    for _, name in ipairs({ "AF_check.log", "check.log" }) do
+        local w = openW(name, false)
+        if w then pcall(function() w:write(body); w:close() end) end
+    end
+    dbg(string.format("WROTE check %s e=%s f=%s m=%s k=%s dmg=%s day=%s",
+        tostring(reason),
+        tostring(d and d.eaten.total or 0),
+        tostring(d and d.fished.total or 0),
+        tostring(d and d.made.total or 0),
+        tostring(d and d.killed.total or 0),
+        tostring(d and d.damage.total or 0),
+        tostring(d and d.daysSurvived or 0)))
+    S.wrote = true
+    S.lastWrite = nowMs()
+    return true
+end
+
+local function after(player, reason, force)
+    if not player then return end
+    if force then
+        Track.writeCheckLog(player, reason)
+        return
+    end
+    local t = nowMs()
+    if t > 0 and (t - S.lastWrite) < 1500 then
+        S.pending = true
+        return
+    end
+    Track.writeCheckLog(player, reason)
+end
+
+function Track.addDamage(p, w, a)
+    local d = Track.getData(p)
+    if not d then return end
+    a = tonumber(a) or 0
+    if a < 0 then a = 0 end
+    if a == 0 then a = 1 end -- hit event without numeric dmg still counts contact
+    bump(d.damage, wparts(w), a)
+    bumpT(d.damage, w, a)
+    after(p, "damage", false)
+end
+
+function Track.addKill(p, w)
+    local d = Track.getData(p)
+    if not d then return end
+    bump(d.killed, wparts(w), 1)
+    bumpT(d.killed, w, 1)
+    after(p, "kill", true)
+end
+
+function Track.addMade(p, k)
+    local d = Track.getData(p)
+    if not d then return end
+    bump(d.made, norm(k), 1)
+    after(p, "made", true)
+end
+
+function Track.addEaten(p, k)
+    local d = Track.getData(p)
+    if not d then return end
+    bump(d.eaten, norm(k), 1)
+    after(p, "eaten", true)
+end
+
+function Track.addFished(p, k)
+    local d = Track.getData(p)
+    if not d then return end
+    bump(d.fished, norm(k), 1)
+    after(p, "fished", true)
+end
+
+function Track.addRead(p, bucket)
+    local d = Track.getData(p)
+    if not d then return end
+    local b = bucket or "book"
+    d.read.total = (d.read.total or 0) + 1
+    d.read[b] = (d.read[b] or 0) + 1
+    after(p, "read", true)
+end
+
+local function pickPlayer(preferred)
+    if preferred then
+        local ok = false
+        pcall(function()
+            if instanceof and instanceof(preferred, "IsoPlayer") then ok = true end
+        end)
+        if ok then return preferred end
+    end
+    if S.lastPlayer then return S.lastPlayer end
+    local p
+    pcall(function() p = getSpecificPlayer(0) end)
+    if p then return p end
+    pcall(function() p = getPlayer() end)
+    return p
+end
+
+local function pn(player)
+    local n = 0
+    pcall(function() if player.getPlayerNum then n = player:getPlayerNum() or 0 end end)
+    return n
+end
+
+local function isLocalPlayer(obj)
+    if not obj then return false end
+    local ok = false
+    pcall(function()
+        if instanceof and instanceof(obj, "IsoPlayer") then
+            if obj.isLocalPlayer then
+                ok = obj:isLocalPlayer() and true or false
+            else
+                ok = true
+            end
+        end
+    end)
+    return ok
+end
+
+local function snapInv(player)
+    local set = {}
+    pcall(function()
+        local list = player:getInventory():getItems()
+        for i = 0, list:size() - 1 do
+            set[list:get(i)] = true
+        end
+    end)
+    return set
+end
+
+local function actionType(action)
+    if not action then return "?" end
+    local t
+    pcall(function() t = action.Type end)
+    if t and tostring(t) ~= "" then return tostring(t) end
+    pcall(function() t = action.type end)
+    if t and tostring(t) ~= "" then return tostring(t) end
+    return "?"
+end
+
+local function noteType(typ)
+    local t = tostring(typ or "?")
+    if not S.seenType[t] then
+        S.seenType[t] = true
+        dbg("ACTIONTYPE " .. t)
+    end
+end
+
+local function classifyLiterature(item)
+    -- Buckets: skillbook | recipe | magazinecomic | book
+    -- B42 literature uses DisplayCategory + LearnedRecipes (not B41 TeachedRecipes alone).
+    if not item then return "book", "" end
+    local bucket = "book"
+    local detail = ""
+    pcall(function()
+        local cat = ""
+        pcall(function()
+            if item.getDisplayCategory then cat = tostring(item:getDisplayCategory() or "") end
+        end)
+        local typ, full = "", ""
+        pcall(function() if item.getType then typ = tostring(item:getType() or "") end end)
+        pcall(function() if item.getFullType then full = tostring(item:getFullType() or "") end end)
+        local low = lower(typ .. " " .. full .. " " .. cat)
+        detail = full ~= "" and full or typ
+
+        -- 1) Skill books
+        local skillKey = nil
+        pcall(function() if item.getSkillTrained then skillKey = item:getSkillTrained() end end)
+        if cat == "SkillBook" or (SkillBook and skillKey and SkillBook[skillKey]) then
+            bucket = "skillbook"
+            detail = tostring(skillKey or cat)
+            return
+        end
+        if skillKey ~= nil and skillKey ~= "" and skillKey ~= false then
+            local s = tostring(skillKey)
+            if s ~= "" and s ~= "nil" and s ~= "none" and s ~= "None" and s ~= "0" then
+                bucket = "skillbook"
+                detail = s
+                return
+            end
+        end
+
+        -- 2) Recipe magazines (B42: DisplayCategory=RecipeResource, LearnedRecipes=...)
+        if cat == "RecipeResource" then
+            bucket = "recipe"
+            return
+        end
+        local hasRecipes = false
+        pcall(function()
+            local recipes = nil
+            if item.getTeachedRecipes then recipes = item:getTeachedRecipes() end
+            if not recipes and item.getLearnedRecipes then recipes = item:getLearnedRecipes() end
+            if not recipes and item.getRecipes then recipes = item:getRecipes() end
+            if recipes then
+                if recipes.isEmpty then hasRecipes = not recipes:isEmpty()
+                elseif recipes.size then hasRecipes = recipes:size() > 0
+                elseif recipes.getSize then hasRecipes = recipes:getSize() > 0
+                elseif type(recipes) == "string" and recipes ~= "" then hasRecipes = true
+                end
+            end
+            -- script ModData / extra fields sometimes expose as string list via getExtraInfo
+            if not hasRecipes and item.getModData then
+                local md = item:getModData()
+                if type(md) == "table" and (md.LearnedRecipes or md.learnedRecipes) then
+                    hasRecipes = true
+                end
+            end
+        end)
+        if hasRecipes then
+            bucket = "recipe"
+            return
+        end
+        -- name patterns: MechanicMag1, KeyMag1, HuntingMag4, EngineerMagazine1, *Mag#
+        if low:find("engineermagazine", 1, true) or low:find("recipe", 1, true)
+            or low:match("mag%d") or low:match("magazine%d")
+            or low:find("schematic", 1, true) then
+            -- avoid treating boredom Magazine_Horror as recipe via Mag — only Mag+digit or Mag1 style
+            if low:match("mag%d") or low:find("engineermagazine", 1, true)
+                or low:find("schematic", 1, true) or cat == "RecipeResource" then
+                bucket = "recipe"
+                return
+            end
+        end
+
+        -- 3) Comics
+        if cat == "Comic" or typ == "ComicBook" or typ == "ComicBook_Retail" or low:find("comic", 1, true) then
+            bucket = "magazinecomic"
+            return
+        end
+
+        -- 4) Magazines / newspapers (DisplayCategory Literature + magazine tag/type)
+        local isArmorMag = low:find("greave", 1, true) or low:find("vambrace", 1, true)
+            or low:find("thighmagazine", 1, true) or low:find("cuirass_magazine", 1, true)
+        if not isArmorMag then
+            local taggedMag = false
+            pcall(function()
+                if item.hasTag and item:hasTag("base:magazine") then taggedMag = true end
+                if item.hasTag and item:hasTag("Magazine") then taggedMag = true end
+                if item.getTags then
+                    local tags = item:getTags()
+                    if tags and tags.contains then
+                        if tags:contains("base:magazine") or tags:contains("magazine") then taggedMag = true end
+                    end
+                end
+            end)
+            if taggedMag or typ == "Magazine" or typ == "Newspaper" or typ == "TVMagazine"
+                or cat == "Literature" and (low:find("magazine", 1, true) or low:find("newspaper", 1, true))
+                or low:find("magazine_", 1, true) or low:find("newspaper", 1, true)
+                or low:find("tvmagazine", 1, true) then
+                bucket = "magazinecomic"
+                return
+            end
+        end
+
+        if cat == "Literature" and not low:find("book", 1, true) then
+            -- subject magazines often Literature without Magazine_ prefix in type... still tags
+            -- leave as book if nothing else
+        end
+        if typ == "Book" or cat == "Literature" or low:find("book", 1, true) then
+            bucket = "book"
+        end
+    end)
+    return bucket, detail
+end
+
+--- Snapshot helpers for meaningful-read gate (B42 CharacterStat / pages / recipes)
+local function moodSnap(player)
+    local boredom, unhappiness, stress = nil, nil, nil
+    pcall(function()
+        local st = player:getStats()
+        if st and st.get and CharacterStat then
+            if CharacterStat.BOREDOM then boredom = st:get(CharacterStat.BOREDOM) end
+            if CharacterStat.UNHAPPINESS then unhappiness = st:get(CharacterStat.UNHAPPINESS) end
+            if CharacterStat.STRESS then stress = st:get(CharacterStat.STRESS) end
+        end
+    end)
+    pcall(function()
+        local bd = player:getBodyDamage()
+        if bd then
+            if boredom == nil and bd.getBoredomLevel then boredom = bd:getBoredomLevel() end
+            if unhappiness == nil and bd.getUnhappynessLevel then unhappiness = bd:getUnhappynessLevel() end
+            if unhappiness == nil and bd.getUnhappinessLevel then unhappiness = bd:getUnhappinessLevel() end
+        end
+    end)
+    pcall(function()
+        if stress == nil then
+            local st = player:getStats()
+            if st and st.getStress then stress = st:getStress() end
+        end
+    end)
+    return boredom, unhappiness, stress
+end
+
+local function knownRecipeCount(player)
+    local n = 0
+    pcall(function()
+        if player.getKnownRecipes then
+            local k = player:getKnownRecipes()
+            if k and k.size then n = k:size() end
+        end
+    end)
+    return n or 0
+end
+
+local function alreadyReadBookHas(player, fullType)
+    local has = false
+    pcall(function()
+        if player.getAlreadyReadBook then
+            local list = player:getAlreadyReadBook()
+            if list and list.contains then has = list:contains(fullType) end
+        end
+    end)
+    return has
+end
+
+local function charReadPages(player, fullType)
+    local n = 0
+    pcall(function()
+        if player.getAlreadyReadPages then
+            n = player:getAlreadyReadPages(fullType) or 0
+        end
+    end)
+    return tonumber(n) or 0
+end
+
+local function itemReadPages(item)
+    local n = 0
+    pcall(function()
+        if item.getAlreadyReadPages then n = item:getAlreadyReadPages() or 0 end
+    end)
+    return tonumber(n) or 0
+end
+
+local function getItemRecipeList(item)
+    local recipes = nil
+    pcall(function()
+        if item.getLearnedRecipes then recipes = item:getLearnedRecipes() end
+        if (not recipes or (recipes.isEmpty and recipes:isEmpty())) and item.getTeachedRecipes then
+            recipes = item:getTeachedRecipes()
+        end
+    end)
+    return recipes
+end
+
+local function itemIsRecipeMag(item)
+    local yes = false
+    pcall(function()
+        if item.getDisplayCategory and tostring(item:getDisplayCategory() or "") == "RecipeResource" then
+            yes = true
+            return
+        end
+        local r = getItemRecipeList(item)
+        if r and r.isEmpty and not r:isEmpty() then yes = true end
+        if r and r.size and r:size() > 0 then yes = true end
+    end)
+    return yes
+end
+
+--- Snippet-style: magazine teaches at least one recipe the player does not know yet.
+local function willLearnNewRecipe(player, item)
+    local will = false
+    pcall(function()
+        local teached = getItemRecipeList(item)
+        if not teached then return end
+        local empty = true
+        if teached.isEmpty then empty = teached:isEmpty()
+        elseif teached.size then empty = teached:size() == 0
+        end
+        if empty then return end
+
+        local known = nil
+        if player.getKnownRecipes then known = player:getKnownRecipes() end
+
+        local n = 0
+        pcall(function() if teached.size then n = teached:size() end end)
+        for i = 0, math.max(n - 1, 0) do
+            local recipeString = nil
+            pcall(function() recipeString = teached:get(i) end)
+            if recipeString ~= nil then
+                local has = false
+                pcall(function()
+                    if known and known.contains then
+                        has = known:contains(recipeString)
+                        -- some lists store Recipe objects; try tostring name
+                        if not has and type(recipeString) ~= "string" then
+                            local name = tostring(recipeString)
+                            has = known:contains(name)
+                            if not has and recipeString.getName then
+                                has = known:contains(recipeString:getName())
+                            end
+                        end
+                    end
+                end)
+                if not has then
+                    will = true
+                    break
+                end
+            end
+        end
+    end)
+    return will
+end
+
+--- True if this finished read did something (recipe / mood / skill pages).
+local function readWasMeaningful(action, player, item)
+    if not action or not player or not item then return false, "no_ctx" end
+
+    local full = ""
+    pcall(function() full = item:getFullType() end)
+    local isRecipe = itemIsRecipeMag(item)
+
+    -- RECIPE MAGS: only first-time learning (snippet ach_WillLearnRecipe).
+    -- Do NOT use mood — B42 still calls ReadLiterature on recipe mags and mood
+    -- improves on every reread (that was the spam path).
+    if isRecipe then
+        if action._AF_willLearnRecipe == true then
+            -- confirm something actually landed if we can
+            local startRecipes = action._AF_startRecipeCount
+            if startRecipes ~= nil then
+                local now = knownRecipeCount(player)
+                if now > startRecipes then
+                    return true, "new_recipe_count"
+                end
+            end
+            if full ~= "" and action._AF_hadReadBook == false and alreadyReadBookHas(player, full) then
+                return true, "alreadyReadBook_add"
+            end
+            -- start said they would learn; still count once even if APIs are fuzzy
+            if action._AF_willLearnRecipe then
+                return true, "will_learn_recipe"
+            end
+        end
+        -- reread / already knew all recipes
+        if action._AF_hadReadBook == true then
+            return false, "recipe_already_read_book"
+        end
+        if action._AF_willLearnRecipe == false then
+            return false, "recipe_already_known"
+        end
+        return false, "recipe_no_effect"
+    end
+
+    -- 1) Non-recipe: already-read book list (rare path)
+    if full ~= "" and action._AF_hadReadBook == false and alreadyReadBookHas(player, full) then
+        return true, "alreadyReadBook_add"
+    end
+
+    -- 2) Mood improvement (boredom / unhappiness / stress down) — comics / boredom mags
+    if action._AF_startBoredom ~= nil or action._AF_startUnhappiness ~= nil or action._AF_startStress ~= nil then
+        local b, u, s = moodSnap(player)
+        local eps = 0.01
+        if action._AF_startBoredom ~= nil and b ~= nil and b < action._AF_startBoredom - eps then
+            return true, "boredom_down"
+        end
+        if action._AF_startUnhappiness ~= nil and u ~= nil and u < action._AF_startUnhappiness - eps then
+            return true, "unhappiness_down"
+        end
+        if action._AF_startStress ~= nil and s ~= nil and s < action._AF_startStress - eps then
+            return true, "stress_down"
+        end
+    end
+
+    -- 3) Skill book pages
+    if action._AF_startCharPages ~= nil and full ~= "" then
+        local nowP = charReadPages(player, full)
+        if nowP > action._AF_startCharPages then
+            return true, "skill_pages_char"
+        end
+    end
+    if action._AF_startItemPages ~= nil then
+        local nowI = itemReadPages(item)
+        local maxP = 0
+        pcall(function() if item.getNumberOfPages then maxP = item:getNumberOfPages() or 0 end end)
+        if nowI > action._AF_startItemPages then
+            return true, "skill_pages_item"
+        end
+        if maxP > 0 and action._AF_startItemPages < maxP and nowI >= maxP then
+            return true, "skill_pages_finish"
+        end
+    end
+
+    -- 4) First-time literature title (comics/subject mags with literatureTitle)
+    if action.isLiteratureRead == false then
+        local title = nil
+        pcall(function()
+            if item.hasModData and item:hasModData() and item:getModData().literatureTitle then
+                title = item:getModData().literatureTitle
+            end
+        end)
+        if title then
+            return true, "new_literature_title"
+        end
+    end
+
+    return false, "no_effect"
+end
+
+local function captureReadStart(action)
+    if not action then return end
+    local player = pickPlayer(action.character)
+    local item = action.item
+    if not player or not item then return end
+    local b, u, s = moodSnap(player)
+    action._AF_startBoredom = b
+    action._AF_startUnhappiness = u
+    action._AF_startStress = s
+    action._AF_startRecipeCount = knownRecipeCount(player)
+    local full = ""
+    pcall(function() full = item:getFullType() end)
+    action._AF_hadReadBook = alreadyReadBookHas(player, full)
+    action._AF_startCharPages = charReadPages(player, full)
+    action._AF_startItemPages = itemReadPages(item)
+    -- Snippet: will this recipe mag teach something new?
+    action._AF_willLearnRecipe = false
+    if itemIsRecipeMag(item) then
+        if action._AF_hadReadBook then
+            action._AF_willLearnRecipe = false
+        else
+            action._AF_willLearnRecipe = willLearnNewRecipe(player, item)
+            -- if recipe list API fails but book never read, allow one shot
+            if action._AF_willLearnRecipe == false then
+                local r = getItemRecipeList(item)
+                local hasList = false
+                pcall(function()
+                    if r and r.isEmpty and not r:isEmpty() then hasList = true end
+                end)
+                if not hasList and not action._AF_hadReadBook then
+                    -- DisplayCategory RecipeResource but empty API — first open only
+                    action._AF_willLearnRecipe = not action._AF_hadReadBook
+                end
+            end
+        end
+    end
+    action._AF_readSnap = true
+    dbg("READ start snap recipes=" .. tostring(action._AF_startRecipeCount)
+        .. " pagesChar=" .. tostring(action._AF_startCharPages)
+        .. " pagesItem=" .. tostring(action._AF_startItemPages)
+        .. " hadBook=" .. tostring(action._AF_hadReadBook)
+        .. " willLearnRecipe=" .. tostring(action._AF_willLearnRecipe))
+end
+
+
+local function handleFinished(player, action, beforeInv, src)
+    if not player or not action then return end
+    local key = tostring(action)
+    if S.finished[key] then return end
+    S.finished[key] = true
+
+    local typ = actionType(action)
+    noteType(typ)
+    local lt = lower(typ)
+    dbg("FINISH " .. tostring(src) .. " typ=" .. typ)
+
+    if lt:find("eat", 1, true) or lt:find("food", 1, true) or lt:find("drink", 1, true) then
+        local id
+        pcall(function()
+            if action.item and action.item.getFullType then id = action.item:getFullType() end
+        end)
+        if id then
+            dbg("EAT " .. id)
+            Track.addEaten(player, id)
+        else
+            dbg("EAT no-item")
+        end
+        return
+    end
+
+    if lt:find("fish", 1, true) or lt:find("pickupfish", 1, true) then
+        local id
+        pcall(function()
+            if action.item and action.item.getFullType then id = action.item:getFullType() end
+        end)
+        if not id and beforeInv then
+            pcall(function()
+                local list = player:getInventory():getItems()
+                for i = 0, list:size() - 1 do
+                    local item = list:get(i)
+                    if not beforeInv[item] then
+                        local ft = ""
+                        pcall(function() ft = lower(item:getFullType()) end)
+                        if not (ft:find("lure", 1, true) or ft:find("line", 1, true) or ft:find("tackle", 1, true)) then
+                            id = item:getFullType()
+                            break
+                        end
+                    end
+                end
+            end)
+        end
+        if id then
+            dbg("FISH " .. id)
+            Track.addFished(player, id)
+        else
+            dbg("FISH no-item")
+        end
+        return
+    end
+
+    if lt:find("craft", 1, true) or lt:find("handcraft", 1, true) or lt:find("recipe", 1, true) then
+        local id
+        pcall(function()
+            if action.recipe and action.recipe.getResult then
+                local r = action.recipe:getResult()
+                if r and r.getFullType then id = r:getFullType() end
+            end
+        end)
+        pcall(function()
+            if not id and action.craftRecipe and action.craftRecipe.getName then
+                id = "recipe." .. tostring(action.craftRecipe:getName())
+            end
+        end)
+        pcall(function()
+            if not id and action.item and action.item.getFullType then id = action.item:getFullType() end
+        end)
+        id = id or ("craft." .. typ)
+        dbg("CRAFT " .. id)
+        Track.addMade(player, id)
+        return
+    end
+
+    if lt:find("build", 1, true) or lt:find("place", 1, true) then
+        local bn
+        pcall(function() if action.objectName then bn = action.objectName end end)
+        local id = "build." .. tostring(bn or typ):gsub("%s+", "_")
+        dbg("BUILD " .. id)
+        Track.addMade(player, id)
+        return
+    end
+
+    if lt:find("read", 1, true) or lt == "isreadabook" or lt:find("literature", 1, true) then
+        local item = action.item or action.literature or action.book
+        local bucket, detail = classifyLiterature(item)
+        local full, cat = "", ""
+        pcall(function() if item and item.getFullType then full = item:getFullType() end end)
+        pcall(function() if item and item.getDisplayCategory then cat = tostring(item:getDisplayCategory() or "") end end)
+
+        local ok, why = false, "no_start_snap"
+        if action._AF_readSnap then
+            ok, why = readWasMeaningful(action, player, item)
+        else
+            -- start wrap missed: still try end-state recipe/book flags only
+            pcall(function()
+                if full ~= "" and alreadyReadBookHas(player, full) then
+                    -- can't know if newly added this finish without start; allow if recipes just known and recipe item
+                    ok, why = true, "no_snap_allow_once"
+                elseif bucket == "recipe" or bucket == "skillbook" or bucket == "magazinecomic" then
+                    ok, why = true, "no_snap_allow_once"
+                end
+            end)
+        end
+        if not ok then
+            dbg("READ skip (" .. tostring(why) .. ") item=" .. tostring(full) .. " cat=" .. tostring(cat))
+            return
+        end
+        dbg("READ " .. tostring(bucket) .. " item=" .. tostring(full) .. " cat=" .. tostring(cat)
+            .. " why=" .. tostring(why) .. " " .. tostring(detail))
+        Track.addRead(player, bucket)
+        return
+    end
+
+    if beforeInv then
+        pcall(function()
+            local list = player:getInventory():getItems()
+            for i = 0, list:size() - 1 do
+                local item = list:get(i)
+                if not beforeInv[item] then
+                    local id = ""
+                    pcall(function() id = item:getFullType() end)
+                    dbg("UNKNOWN_GAIN " .. tostring(id) .. " during " .. typ)
+                end
+            end
+        end)
+    end
+end
+
+local function markStart(player, action, src)
+    if not player or not action then return end
+    local id = pn(player)
+    S.beforeInv[id] = snapInv(player)
+    S.lastAction[id] = action
+    S.lastActionTyp[id] = actionType(action)
+    noteType(S.lastActionTyp[id])
+    dbg("START " .. tostring(src) .. " " .. tostring(S.lastActionTyp[id]))
+    -- early read baseline if ISReadABook:start wrap not hit yet
+    pcall(function()
+        local typ = lower(S.lastActionTyp[id] or "")
+        if typ:find("read", 1, true) and not action._AF_readSnap then
+            captureReadStart(action)
+        end
+    end)
+end
+
+-- STATIC add(action) — never treat first arg as self unless it looks like a queue
+local function onQueued(action, via)
+    if not action then return end
+    local player
+    pcall(function() player = action.character end)
+    player = pickPlayer(player)
+    dbg("QUEUE." .. tostring(via) .. " " .. actionType(action))
+    if player then markStart(player, action, via) end
+end
+
+local function hookQueue()
+    local Q = rawget(_G, "ISTimedActionQueue")
+    if type(Q) ~= "table" then
+        dbg("queue missing")
+        return false
+    end
+
+    if not Q._AF80_add and type(Q.add) == "function" then
+        local orig = Q.add
+        Q.add = function(a1, a2)
+            -- static: add(action)  OR mistaken method: add(self, action)
+            local action = a1
+            if type(a1) == "table" and a1.queue ~= nil and a2 ~= nil then
+                action = a2
+                onQueued(action, "add:m")
+                return orig(a1, a2)
+            end
+            onQueued(action, "add")
+            return orig(a1, a2)
+        end
+        Q._AF80_add = true
+        dbg("hooked queue.add")
+    end
+
+    if not Q._AF80_addAfter and type(Q.addAfter) == "function" then
+        local orig = Q.addAfter
+        Q.addAfter = function(prev, action)
+            onQueued(action, "addAfter")
+            return orig(prev, action)
+        end
+        Q._AF80_addAfter = true
+        dbg("hooked queue.addAfter")
+    end
+
+    if not Q._AF80_addToQueue and type(Q.addToQueue) == "function" then
+        local orig = Q.addToQueue
+        Q.addToQueue = function(self, action)
+            onQueued(action, "addToQueue")
+            return orig(self, action)
+        end
+        Q._AF80_addToQueue = true
+        dbg("hooked queue.addToQueue")
+    end
+
+    if not Q._AF80_onCompleted and type(Q.onCompleted) == "function" then
+        local orig = Q.onCompleted
+        Q.onCompleted = function(self, action)
+            local player = pickPlayer(self and self.character)
+            local id = player and pn(player) or 0
+            dbg("QUEUE.onCompleted " .. actionType(action))
+            pcall(function()
+                handleFinished(player, action, S.beforeInv[id], "onCompleted")
+            end)
+            local r = orig(self, action)
+            S.lastAction[id] = nil
+            S.lastActionTyp[id] = nil
+            S.beforeInv[id] = nil
+            return r
+        end
+        Q._AF80_onCompleted = true
+        dbg("hooked queue.onCompleted")
+    end
+
+    S.queueHooked = Q._AF80_add and true or false
+    return S.queueHooked
+end
+
+local function wrapMethod(tbl, className, methodName)
+    if type(tbl) ~= "table" then return false end
+    local flag = "_AF80_" .. methodName
+    if tbl[flag] then return true end
+    local orig = tbl[methodName]
+    if type(orig) ~= "function" then return false end
+    tbl[methodName] = function(self)
+        local player = pickPlayer(self and self.character)
+        local before = player and snapInv(player) or nil
+        noteType(actionType(self))
+        dbg("class." .. methodName .. " " .. className)
+        local r = orig(self)
+        pcall(function()
+            handleFinished(player, self, before, "class:" .. className .. ":" .. methodName)
+        end)
+        return r
+    end
+    tbl[flag] = true
+    return true
+end
+
+local function wrapReadABook()
+    local tbl = rawget(_G, "ISReadABook")
+    if type(tbl) ~= "table" or tbl._AF83_readGate then return end
+    -- start: baseline
+    if type(tbl.start) == "function" and not tbl._AF83_start then
+        local origS = tbl.start
+        tbl.start = function(self)
+            local r = origS(self)
+            pcall(function() captureReadStart(self) end)
+            return r
+        end
+        tbl._AF83_start = true
+    end
+    -- still wrap perform/complete via generic, but gate is inside handleFinished
+    wrapMethod(tbl, "ISReadABook", "perform")
+    wrapMethod(tbl, "ISReadABook", "complete")
+    tbl._AF83_readGate = true
+    dbg("ISReadABook meaningful-read gate hooked")
+end
+
+
+local function wrapClass(name)
+    local tbl = rawget(_G, name)
+    if type(tbl) ~= "table" then return end
+    if name == "ISReadABook" then
+        wrapReadABook()
+        return
+    end
+    local did = false
+    if wrapMethod(tbl, name, "perform") then did = true end
+    if wrapMethod(tbl, name, "complete") then did = true end
+    if did and not tbl._AF80c then
+        tbl._AF80c = true
+        S.wrapCount = S.wrapCount + 1
+        dbg("classwrap " .. name)
+    end
+end
+
+local function scanClasses()
+    local names = {
+        "ISEatFoodAction", "ISDrinkFoodAction", "ISCraftAction", "ISHandcraftAction",
+        "ISBuildAction", "ISPickupFishAction", "ISReadABook", "ISBaseTimedAction",
+    }
+    for i = 1, #names do wrapClass(names[i]) end
+end
+
+local function pollQueue(player)
+    if not player then return end
+    local id = pn(player)
+    local cur = nil
+    pcall(function()
+        local Q = ISTimedActionQueue
+        if not Q or not Q.getTimedActionQueue then return end
+        local q = Q.getTimedActionQueue(player)
+        if not q then return end
+        cur = q.current
+        if not cur and type(q.queue) == "table" then cur = q.queue[1] end
+    end)
+    local prev = S.lastAction[id]
+    if cur and cur ~= prev then
+        markStart(player, cur, "poll")
+    elseif prev and not cur then
+        dbg("END poll " .. tostring(S.lastActionTyp[id]))
+        pcall(function()
+            handleFinished(player, prev, S.beforeInv[id], "poll")
+        end)
+        S.lastAction[id] = nil
+        S.lastActionTyp[id] = nil
+        S.beforeInv[id] = nil
+    end
+end
+
+local function bootPlayer(player, reason)
+    player = pickPlayer(player)
+    hookQueue()
+    scanClasses()
+    if not player then
+        dbg(tostring(reason) .. " no-player")
+        return
+    end
+    S.lastPlayer = player
+    Track.getData(player)
+    Track.writeCheckLog(player, reason)
+end
+
+-- ---- combat: AU-proven + Knox-proven ----
+-- Kill once per zombie; damage once per hit window (Char+Xp+OnHitZombie all fire).
+local function markKill(player, zombie, weapon, src)
+    if not player or not zombie then return false end
+    if type(S.killedOnce) ~= "table" then S.killedOnce = {} end
+    if S.killedOnce[zombie] then return false end
+    S.killedOnce[zombie] = true
+    dbg("KILL " .. tostring(src))
+    Track.addKill(player, weapon)
+    return true
+end
+
+local function markDamage(player, zombie, weapon, amount, src)
+    if not player then return end
+    amount = tonumber(amount) or 0
+    if amount < 0 then amount = 0 end
+    local t = nowMs()
+    local key = tostring(zombie) .. "|" .. tostring(weapon)
+    -- same swing often fires OnHitZombie (+1) + Char + Xp within one frame
+    if S.dmgKey == key and t > 0 and (t - (S.dmgMs or 0)) < 80 then
+        -- keep the larger amount if a later event has real dmg
+        if amount > 0 and amount > (S.dmgLast or 0) and S.dmgLast <= 1 then
+            local d = Track.getData(player)
+            if d then
+                local bumpAmt = amount - (S.dmgLast or 0)
+                if bumpAmt > 0 then
+                    bump(d.damage, wparts(weapon), bumpAmt)
+                    bumpT(d.damage, weapon, bumpAmt)
+                    after(player, "damage", false)
+                end
+            end
+            S.dmgLast = amount
+        end
+        return
+    end
+    S.dmgKey, S.dmgMs, S.dmgLast = key, t, amount
+    if amount == 0 then amount = 1 end
+    dbg("DMG " .. tostring(src) .. " a=" .. tostring(amount))
+    Track.addDamage(player, weapon, amount)
+end
+
+local function onHitZombie(zombie, attacker, bodyPart, weapon)
+    pcall(function()
+        if not zombie then return end
+        local player = pickPlayer(nil)
+        if not player then return end
+        if attacker and attacker ~= player then
+            if not isLocalPlayer(attacker) then return end
+        end
+        local w = weapon
+        if not w then
+            pcall(function() w = player:getPrimaryHandItem() end)
+        end
+        local prev = S.zedHit[zombie]
+        S.zedHit[zombie] = { weapon = w, t = S.tick, killed = prev and prev.killed }
+        dbg("HITZED")
+        -- attribution only; numeric dmg comes from Char/Xp when available
+        markDamage(player, zombie, w, 1, "HitZombie")
+    end)
+end
+
+local function onZombieDead(zombie)
+    pcall(function()
+        if not zombie then return end
+        local player = pickPlayer(nil)
+        if not player then return end
+        local tr = S.zedHit[zombie]
+        -- Only count if we previously attributed a hit to the local player (AU pattern)
+        if not tr then return end
+        local w = tr.weapon
+        if not w then
+            pcall(function() w = player:getPrimaryHandItem() end)
+        end
+        markKill(player, zombie, w, "ZedDead")
+        S.zedHit[zombie] = nil
+    end)
+end
+
+local function onWeaponHitXp(owner, weapon, hitObject, damage)
+    pcall(function()
+        if not S.hitArgsOnce then
+            S.hitArgsOnce = true
+            dbg("HITARGS Xp " .. type(owner) .. " " .. type(weapon) .. " " .. type(hitObject) .. " " .. tostring(damage))
+        end
+        if not isLocalPlayer(owner) then return end
+        local isZ = false
+        pcall(function()
+            if hitObject and instanceof and instanceof(hitObject, "IsoZombie") then isZ = true end
+        end)
+        if not isZ then return end
+        dbg("HIT Xp dmg=" .. tostring(damage))
+        markDamage(owner, hitObject, weapon, damage, "Xp")
+        local prev = S.zedHit[hitObject]
+        S.zedHit[hitObject] = { weapon = weapon, t = S.tick, killed = prev and prev.killed }
+        local dead = false
+        pcall(function() if hitObject.isDead and hitObject:isDead() then dead = true end end)
+        pcall(function() if not dead and hitObject.getHealth and hitObject:getHealth() <= 0 then dead = true end end)
+        if dead then
+            markKill(owner, hitObject, weapon, "Xp")
+        end
+    end)
+end
+
+local function onWeaponHitCharacter(attacker, target, weapon, damage)
+    pcall(function()
+        if not isLocalPlayer(attacker) then return end
+        local isZ = false
+        pcall(function()
+            if target and instanceof and instanceof(target, "IsoZombie") then isZ = true end
+        end)
+        if not isZ then return end
+        dbg("HIT Char dmg=" .. tostring(damage))
+        markDamage(attacker, target, weapon, damage, "Char")
+        local prev = S.zedHit[target]
+        S.zedHit[target] = { weapon = weapon, t = S.tick, killed = prev and prev.killed }
+    end)
+end
+
+local function onTick()
+    S.tick = S.tick + 1
+    pcall(function()
+        local player = pickPlayer(nil)
+        if player then S.lastPlayer = player end
+
+        -- heartbeat every ~300 ticks (~5s at 60fps) regardless of timestamp
+                if (S.tick - S.lastBeatTick) >= 300 then
+                    S.lastBeatTick = S.tick
+                    -- Drop finish-dedupe keys; dual perform/onCompleted fires within ms, not across beats.
+                    -- Without this, tostring(action) keys accumulate for the whole session.
+                    S.finished = {}
+                    hookQueue()
+                    if player then
+                        pollQueue(player)
+                        if S.pending then
+                            S.pending = false
+                            Track.writeCheckLog(player, "flush")
+                        end
+                    end
+                    dbg(string.format("BEAT tick=%s player=%s queue=%s wraps=%s k=%s e=%s",
+                        tostring(S.tick),
+                        tostring(player ~= nil),
+                        tostring(S.queueHooked),
+                        tostring(S.wrapCount),
+                        tostring(player and Track.getData(player) and Track.getData(player).killed.total or 0),
+                        tostring(player and Track.getData(player) and Track.getData(player).eaten.total or 0)))
+                end
+
+        -- lighter poll every 15 ticks while playing
+        if player and (S.tick % 15) == 0 then
+            pollQueue(player)
+        end
+    end)
+end
+
+local function onPlayerUpdate(player)
+    pcall(function()
+        if not player then return end
+        if not isLocalPlayer(player) then return end
+        S.lastPlayer = player
+        if not S.wrote then bootPlayer(player, "OnPlayerUpdate_first") end
+        pollQueue(player)
+    end)
+end
+
+local function safeAdd(eventName, fn)
+    local ok, err = pcall(function()
+        local ev = Events[eventName]
+        if ev and ev.Add then
+            ev.Add(fn)
+            dbg("Events." .. eventName)
+            return true
+        end
+        dbg("NO " .. eventName)
+        return false
+    end)
+    if not ok then dbg("ADDFAIL " .. eventName .. " " .. tostring(err)) end
+end
+
+local function install()
+    if S.installed then
+        hookQueue()
+        scanClasses()
+        return
+    end
+    S.installed = true
+    dbg("install handlers")
+
+    safeAdd("OnTick", onTick)
+    safeAdd("OnPlayerUpdate", onPlayerUpdate)
+    safeAdd("OnGameStart", function()
+        dbg("OnGameStart")
+        hookQueue()
+        scanClasses()
+        bootPlayer(nil, "OnGameStart")
+    end)
+    safeAdd("OnCreatePlayer", function(playerIndex, player)
+        dbg("OnCreatePlayer")
+        local p = player
+        if type(playerIndex) ~= "number" then p = playerIndex end
+        bootPlayer(p, "OnCreatePlayer")
+    end)
+    -- Only dump check on living player characters (not every zombie)
+    safeAdd("OnCreateLivingCharacter", function(a, b)
+        local p = a
+        if type(a) == "number" then p = b end
+        if isLocalPlayer(p) then
+            dbg("OnCreateLivingCharacter player")
+            bootPlayer(p, "OnCreateLivingCharacter")
+        end
+    end)
+    safeAdd("OnSave", function()
+        dbg("OnSave")
+        local p = pickPlayer(nil)
+        if p then Track.writeCheckLog(p, "OnSave") end
+    end)
+    safeAdd("EveryOneMinute", function()
+        local p = pickPlayer(nil)
+        if p then Track.writeCheckLog(p, "EveryOneMinute") end
+    end)
+    safeAdd("OnMainMenuEnter", function() dbg("OnMainMenuEnter") end)
+
+    -- kills / hits
+    safeAdd("OnHitZombie", onHitZombie)
+    safeAdd("OnZombieDead", onZombieDead)
+    safeAdd("OnWeaponHitXp", onWeaponHitXp)
+    safeAdd("OnWeaponHitCharacter", onWeaponHitCharacter)
+
+    hookQueue()
+    scanClasses()
+    dbg("install done queue=" .. tostring(S.queueHooked) .. " wraps=" .. tostring(S.wrapCount))
+end
+
+install()
