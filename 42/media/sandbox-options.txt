@@ -1,0 +1,11 @@
+VERSION = 1,
+
+option AchievementFramework.BrowserHotkey
+{
+	type = integer,
+	min = 1,
+	max = 300,
+	default = 36,
+	page = AchievementFramework,
+	translation = AchievementFramework_BrowserHotkey,
+}
