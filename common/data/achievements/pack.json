@@ -1,0 +1,92 @@
+[
+  {
+    "name": "Good Start",
+    "action": "kill",
+    "modifier": "none",
+    "amount": 1000,
+    "rewardType": "item",
+    "reward": "Base.Bag_ALICEpack",
+    "rewardAmount": 1
+  },
+  {
+    "name": "God of War",
+    "action": "kill",
+    "modifier": "type.firearm",
+    "amount": 1500,
+    "rewardType": "item",
+    "reward": "Base.AssaultRifle",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Can't Have One Without the Other",
+    "action": "kill",
+    "modifier": "type.firearm",
+    "amount": 1501,
+    "rewardType": "item",
+    "reward": "Base.556Clip",
+    "rewardAmount": 3
+  },
+  {
+    "name": "Let's Up Those Numbers",
+    "action": "kill",
+    "modifier": "type.firearm",
+    "amount": 1502,
+    "rewardType": "item",
+    "reward": "Base.556Carton",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Prepper",
+    "action": "daysSurvived",
+    "modifier": "none",
+    "amount": 1,
+    "rewardType": "item",
+    "reward": "Base.HandAxe",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Survivor",
+    "action": "daysSurvived",
+    "modifier": "none",
+    "amount": 14,
+    "rewardType": "item",
+    "reward": "Base.Axe",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Reader",
+    "action": "read",
+    "modifier": "none",
+    "amount": 20,
+    "rewardType": "skill_xp",
+    "reward": "Electricity",
+    "rewardAmount": 500
+  },
+  {
+    "name": "Fisherman",
+    "action": "fish",
+    "modifier": "none",
+    "amount": 15,
+    "rewardType": "item",
+    "reward": "Base.JigLure",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Gourmand",
+    "action": "eat",
+    "modifier": "none",
+    "amount": 200,
+    "rewardType": "trait",
+    "reward": "Nutritionist",
+    "rewardAmount": 1
+  },
+  {
+    "name": "Need for Speed",
+    "action": "distance",
+    "modifier": "vehicle",
+    "amount": 20000,
+    "rewardType": "trait",
+    "reward": "SpeedDemon",
+    "rewardAmount": 1
+  }
+]
